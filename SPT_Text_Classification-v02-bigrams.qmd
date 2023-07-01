@@ -1,0 +1,913 @@
+---
+title: "SeverusPT automated text clasification"
+author: "JG, APP"
+format: pdf
+editor: visual
+number-sections: true
+number-depth: 3
+---
+
+# Text mining and classification of papers
+
+The main objective for this task is to use examples of papers that are selected (or not) for each of the phases of wildfire research, namely:
+
+-   Pre-fire
+-   During-fire
+-   Post-fire
+
+Then a Random Forest model will be used to learn with these binary examples and classify all the remaining papers as selected or non-selected.
+
+## Count functions
+
+Load libs and define ancillary functions
+
+```{r}
+#| warning: false
+#| error: false
+#| message: false
+#| echo: false
+
+library(tidytext)
+library(stringr)
+library(dplyr)
+library(caTools)
+library(tidyr)
+library(tidytext)
+library(readr)
+library(tidyverse)
+library(randomForest)
+library(Metrics)
+
+auroc <- function(score, bool) {
+  n1 <- sum(!bool)
+  n2 <- sum(bool)
+  U  <- sum(rank(score)[!bool]) - n1 * (n1 + 1) / 2
+  return(1 - U / n1 / n2)
+}
+
+count_common_words <- function(title, common_words) {
+  # tokenize the title into individual words
+  words <- str_split(title, "\\s+")[[1]]
+  
+  # count the number of occurrences of each common word
+  counts <- sapply(common_words, function(word) as.integer(sum(words == word) > 0))
+  
+  # return the vector of counts, with zeros included for words not found
+  return(ifelse(is.na(counts), 0, counts))
+}
+
+count_common_keywords <- function(title, common_words) {
+  
+  # tokenize the title into individual words
+  words <- str_split(gsub(";","",title), "\\s+")[[1]]
+  
+  # count the number of occurrences of each common word
+  counts <- sapply(common_words, function(word) as.integer(sum(words == word) > 0))
+  
+  # return the vector of counts, with zeros included for words not found
+  return(ifelse(is.na(counts), 0, counts))
+}
+
+
+
+```
+
+## Data
+
+Read the data and perform some basic preparation
+
+Check colnames in the dataset
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+papers <- read_csv("pre_fire_title_screening_v2.csv") %>% 
+  mutate(included = ifelse(screened_titles == "selected", 1, 0))
+
+print(colnames(papers))
+
+train_papers <- papers %>% 
+  select(-1, -3) %>% 
+  filter(!is.na(screened_titles)) %>% 
+  filter(screened_titles %in% c("selected", "excluded")) %>% 
+  mutate(included = ifelse(screened_titles == "selected", 1, 0))
+
+
+```
+
+
+Print class percentages:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+tb <- table(train_papers$screened_titles)
+
+knitr::kable((tb / sum(tb))*100, digits = 2)
+
+
+```
+
+
+
+## Training data
+
+The training dataset is made by combining the following binary features,
+
+-   Top-30 most common words/terms from the **title** in *selected papers*;
+
+-   Top-30 most common words/terms from the **title** in *non-selected papers*;
+
+-   Top-30 most common words/terms from the **keywords** in *selected papers*;
+
+-   Top-30 most common words/terms from the **keywords** in *non-selected papers*;
+
+### Step 1 - count the most frequent terms in the title and keywords
+
+#### Title top-30 terms
+
+Count words in titles (after removing common/stop words) and select those terms that are most common in selected/accepted papers and non-selected/non-accepted papers.
+
+These terms will be used as binary features in RF classification.
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# tokenize each title into individual words
+words_tibble <- train_papers %>%
+  select(label, title, included) %>% 
+  unnest_tokens(word, title) %>% 
+  anti_join(stop_words, by = join_by(word)) # remove very common terms
+
+
+# group the words by acceptance and count their frequency
+freq_tibble <- words_tibble %>%
+  count(included, word, sort = TRUE)
+
+
+# additional stuff to remove
+to_rm <- c("ð", "â", "based", "due", 1:10)
+
+
+# get the 30 most common words for accepted papers
+common_words_selected_papers <- freq_tibble %>%
+  filter(included == 1) %>% 
+  filter(!is.na(word)) %>% 
+  filter(!(word %in% to_rm)) %>% 
+  slice(1:30)
+
+
+# get the 30 most common words for non-accepted papers
+common_words_unselected_papers <- freq_tibble %>%
+  filter(included == 0) %>% 
+  filter(!(word %in% common_words_selected_papers$word)) %>% 
+  filter(!is.na(word)) %>% 
+  filter(!(word %in% to_rm)) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:30)
+
+```
+
+List of common terms in *titles* for *selected papers*:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(common_words_selected_papers)
+```
+
+List of common terms in *titles* for *non-selected papers*:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(common_words_unselected_papers)
+```
+
+
+------------------------------------------------------------------------
+
+#### Keywords top-30 terms
+
+Now repeat the same process but now using keywords:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# tokenize each keyword list into individual words
+keywords_tibble <- train_papers %>%
+  select(label, keywords, included) %>% 
+  unnest_tokens(keyword, keywords) %>%
+  anti_join(stop_words, by=c("keyword"="word"))
+
+
+# group the words by acceptance and count their frequency
+keywords_freq_tibble <- keywords_tibble %>%
+  count(included, keyword, sort = TRUE)
+
+
+# get the 30 most common keywords for non-accepted papers
+common_keywords_selected_papers <- keywords_freq_tibble %>%
+  filter(included == 1) %>% 
+  filter(!is.na(keyword)) %>% 
+  filter(!(keyword %in% to_rm)) %>% 
+  # Remove terms already selected from the title
+  #filter(!(keyword %in% common_words_selected_papers$word)) %>% 
+  #filter(!(keyword %in% common_words_unselected_papers$word)) %>% 
+  slice(1:30)
+
+
+# get the 30 most common keywords for non-accepted papers
+common_keywords_unselected_papers <- keywords_freq_tibble %>%
+  filter(included == 0) %>% 
+  # Remove terms already selected before
+  filter(!(keyword %in% common_keywords_selected_papers$keyword)) %>% 
+  # Remove terms already selected from the title
+  #filter(!(keyword %in% common_words_selected_papers$word)) %>% 
+  #filter(!(keyword %in% common_words_unselected_papers$word)) %>% 
+  filter(!is.na(keyword)) %>% 
+  filter(!(keyword %in% to_rm)) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:30)
+
+```
+
+
+List of common terms in *keywords* for *selected papers*:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(common_keywords_selected_papers)
+```
+
+List of common terms in *keywords* for *non-selected papers*:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(common_keywords_unselected_papers)
+```
+
+
+
+------------------------------------------------------------------------
+
+#### Abstract top-30 terms
+
+Now repeat the same process but now using the abstract:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# tokenize each keyword list into individual words
+abstract_tibble <- train_papers %>%
+  select(label, abstract, included) %>% 
+  unnest_tokens(abstract_, abstract) %>%
+  anti_join(stop_words, by=c("abstract_"="word"))
+
+
+# group the words by acceptance and count their frequency
+abstract_freq_tibble <- abstract_tibble %>%
+  count(included, abstract_, sort = TRUE)
+
+
+# get the 30 most common keywords for non-accepted papers
+common_abstract_selected_papers <- abstract_freq_tibble %>%
+  filter(included == 1) %>% 
+  filter(!is.na(abstract_)) %>% 
+  filter(!(abstract_ %in% to_rm)) %>%  
+  slice(1:50)
+
+
+# get the 30 most common keywords for non-accepted papers
+common_abstract_unselected_papers <- abstract_freq_tibble %>%
+  filter(included == 0) %>% 
+  # Remove terms already selected before
+  filter(!(abstract_ %in% common_abstract_selected_papers$abstract_)) %>% 
+  filter(!is.na(abstract_)) %>% 
+  filter(!(abstract_ %in% to_rm)) %>% 
+  arrange(desc(n)) %>% 
+  slice(1:50)
+
+```
+
+List of common terms in *abstracts* for *selected papers*:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(common_abstract_selected_papers)
+```
+
+List of common terms in *abstracts* for *non-selected papers*:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(common_abstract_unselected_papers)
+```
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+bigram_rm <- c(
+  "rights reserved",
+  "ecological society",
+  "business media",
+  "springer science",
+  "science business",
+  "results suggest",
+  "pine pinus",
+  "john wiley",
+  "wiley sons",
+  "basel switzerland",
+  "licensee mdpi",
+  "mdpi basel",
+  "authors licensee",
+  "copyright â",
+  "experimental results",
+  "taylor francis",
+  "springer nature",
+  "media llc",
+  "fire â",
+  "mg ha")
+
+
+# create a vector of all bi-grams to keep 
+ngram_list <- train_papers %>%
+  unnest_tokens(bigram, `abstract`, token = "ngrams", n = 2) %>%  
+  separate(bigram, c("word1", "word2"), sep = " ") %>%               
+  filter(
+    !word1 %in% stop_words$word,                 # remove stopwords from both words in bi-gram
+    !word2 %in% stop_words$word,
+    !str_detect(word1, pattern = "[[:digit:]]"), # removes any words with numeric digits
+    !str_detect(word2, pattern = "[[:digit:]]"),
+    !str_detect(word1, pattern = "[[:punct:]]"), # removes any remaining punctuations
+    !str_detect(word2, pattern = "[[:punct:]]"),
+    !str_detect(word1, pattern = "(.)\\1{2,}"),  # removes any words with 3 or more repeated letters
+    !str_detect(word2, pattern = "(.)\\1{2,}"),
+    !str_detect(word1, pattern = "\\b(.)\\b"),   # removes any remaining single letter words
+    !str_detect(word1, pattern = "\\b(.)\\b")
+    ) %>%
+  unite("bigram", c(word1, word2), sep = " ") %>%
+  filter(
+    !str_detect(bigram, pattern = paste(bigram_rm,collapse="|"))
+  ) %>% 
+  count(bigram) %>%
+  arrange(desc(n))
+
+ngram_list_sel <- ngram_list %>%   
+  filter(n >= 30) %>% # filter for bi-grams used 30 or more times
+  pull(bigram)
+
+
+ngram_features <- train_papers %>%
+  unnest_tokens(bigram, `abstract`, token = "ngrams", n = 2) %>%
+  filter(bigram %in% ngram_list_sel) %>%    # filter for only bi-grams in the ngram_list
+  count(label, bigram) %>%                 # count bi-gram usage 
+  spread(bigram, n) %>%                 # convert to wide format
+  map_df(replace_na, 0)                 # replace NAs with 0
+
+ngram_features_n <- ngram_features %>% 
+  right_join(train_papers %>% select("label"), by="label") %>% 
+  map_df(replace_na, 0) %>% 
+  `colnames<-`(paste("bigram_",gsub("\\ +","_",colnames(.)),sep=""))
+
+
+```
+
+
+List bigrams in *abstracts* for all papers:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(ngram_list %>%   
+  filter(n >= 30))
+```
+
+
+Generate bigrams for the entire dataset
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+ngram_features_all <- papers %>%
+  unnest_tokens(bigram, `abstract`, token = "ngrams", n = 2) %>%
+  filter(bigram %in% ngram_list_sel) %>%    # filter for only bi-grams in the ngram_list
+  count(label, bigram) %>%                 # count bi-gram usage 
+  spread(bigram, n) %>%                 # convert to wide format
+  map_df(replace_na, 0)                 # replace NAs with 0
+
+ngram_features_n_all <- ngram_features %>% 
+  right_join(papers %>% select("label"), by="label") %>% 
+  map_df(replace_na, 0) %>% 
+  `colnames<-`(paste("bigram_",gsub("\\ +","_",colnames(.)),sep=""))
+
+```
+
+
+### Step 2 - make features
+
+Count the selected words in the title and keywords and arrange them as a binary grid:
+
+#### Title-based features
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# Title words
+
+# create a new tibble with the counts for each of the top 30 words in titles
+counts_sel_words <- t(apply(as.data.frame(train_papers %>% select(title)), 1, count_common_words, 
+                         common_words = common_words_selected_papers$word)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("words_sel_", colnames(.)))
+
+# create a new tibble with the counts for each of the top 30 words
+counts_unsel_words <- t(apply(as.data.frame(train_papers %>% select(title)), 1, count_common_words, 
+                            common_words = common_words_unselected_papers$word)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("words_nsel_", colnames(.)))
+
+```
+
+#### Keyword-based features
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# Keywords
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_sel_keywords <- t(apply(as.data.frame(train_papers %>% select(keywords)), 1, count_common_keywords, 
+                            common_words = common_keywords_selected_papers$keyword)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("keywords_sel_", colnames(.)))
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_unsel_keywords <- t(apply(as.data.frame(train_papers %>% select(keywords)), 1, count_common_keywords, 
+                              common_words = common_keywords_unselected_papers$keyword)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("keywords_nsel_", colnames(.)))
+```
+
+
+#### Abstract-based features
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# Abstract
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_sel_abstract <- t(apply(as.data.frame(train_papers %>% select(abstract)), 1, count_common_words, 
+                            common_words = common_abstract_selected_papers$abstract_)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("abstract_sel_", colnames(.)))
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_unsel_abstract <- t(apply(as.data.frame(train_papers %>% select(abstract)), 1, count_common_words, 
+                              common_words = common_abstract_unselected_papers$abstract_)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("abstract_nsel_", colnames(.)))
+```
+
+
+
+
+### Step3 - assemble all features and labels
+
+Make the training dataset by combining everything:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# combine the counts with the original titles and labels
+train_tb <- bind_cols(train_papers %>% select(label, included), 
+                      counts_sel_words, 
+                      counts_unsel_words,
+                      counts_sel_keywords,
+                      counts_unsel_keywords,
+                      counts_sel_abstract,
+                      counts_unsel_abstract)
+
+train_tb <- train_tb %>% 
+  left_join(ngram_features_n, 
+            by=c("label"="bigram_label"))
+
+#cat("Training dataset:\n\n")
+#knitr::kable(train_tb %>% slice(1:10) %>% t)
+
+```
+
+
+
+## Prediction dataset
+
+Step 1 - Evaluate the same features as before but now for the entire dataset of papers
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# This part prepares the prediction dataset to use the RF model
+
+# create a new tibble with the counts for each of the top 30 words
+counts_sel_words_all <- t(apply(as.data.frame(papers %>% select(title)), 1, count_common_words, 
+                            common_words = common_words_selected_papers$word)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("words_sel_", colnames(.)))
+
+# create a new tibble with the counts for each of the top 30 words
+counts_unsel_words_all <- t(apply(as.data.frame(papers %>% select(title)), 1, count_common_words, 
+                              common_words = common_words_unselected_papers$word)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("words_nsel_", colnames(.)))
+
+
+## ------------------------------------------------------------------------------------------------ ##
+
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_sel_keywords_all <- t(apply(as.data.frame(papers %>% select(keywords)), 1, count_common_keywords, 
+                               common_words = common_keywords_selected_papers$keyword)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("keywords_sel_", colnames(.)))
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_unsel_keywords_all <- t(apply(as.data.frame(papers %>% select(keywords)), 1, count_common_keywords, 
+                                 common_words = common_keywords_unselected_papers$keyword)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("keywords_nsel_", colnames(.)))
+
+
+
+## ------------------------------------------------------------------------------------------------ ##
+
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_sel_abstract_all <- t(apply(as.data.frame(papers %>% select(abstract)), 1, count_common_words, 
+                               common_words = common_abstract_selected_papers$abstract_)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("abstract_sel_", colnames(.)))
+
+# create a new tibble with the counts for each of the top 30 keywords
+counts_unsel_abstract_all <- t(apply(as.data.frame(papers %>% select(abstract)), 1, count_common_words, 
+                                 common_words = common_abstract_unselected_papers$abstract_)) %>% 
+  as.data.frame() %>% 
+  `colnames<-`(paste0("abstract_nsel_", colnames(.)))
+
+
+```
+
+Step 2 - Assemble the full prediction dataset:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+# combine the counts with the original titles and labels
+pred_tb <- bind_cols(papers %>% select(label, included), 
+                      # Title words
+                      counts_sel_words_all, 
+                      counts_unsel_words_all,
+                      # Keywords
+                      counts_sel_keywords_all,
+                      counts_unsel_keywords_all,
+                      # Abstract
+                      counts_sel_abstract_all,
+                      counts_unsel_abstract_all
+                     )
+
+
+pred_tb <- pred_tb %>% 
+  left_join(ngram_features_n_all, 
+            by=c("label"="bigram_label"))
+
+#cat("Prediction dataset:\n\n")
+#knitr::kable(pred_tb %>% slice(1:10) %>% t)
+
+```
+
+
+
+## Random Forest model development
+
+
+### Optimize RF hyperparameters
+
+Make the classification model based on Random Forests:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+## Full model
+mtry_vals <- 3:15
+rfs<-list()
+acc_vals <- c()
+i<-0
+pb <- txtProgressBar(1, length(mtry_vals), style=3)
+
+for (mtry_val in mtry_vals){
+  i<-i+1
+  rfs[[i]] <- randomForest(x = train_tb %>% select(-label, -included),
+             y = train_tb %>% pull(included) %>% as.factor(), 
+             ntree=1000, mtry = mtry_val)
+  
+  conf <- rfs[[i]]$confusion[1:2, 1:2]
+  acc_vals[i] <- sum(diag(conf))/sum(conf)
+  
+  setTxtProgressBar(pb,i)  
+}
+
+
+best_mtry <- mtry_vals[which.max(acc_vals)]
+
+cat("best mtry value:\n\n")
+print(best_mtry)
+
+
+rf <- randomForest(x = train_tb %>% select(-label, -included),
+             y = train_tb %>% pull(included) %>% as.factor(), 
+             ntree = 1000, mtry = best_mtry)
+
+print(rf)
+
+plot(rf)
+
+
+```
+
+### Ten fold cross-validation
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+library(caret)
+
+## Set seed for reproducibility
+set.seed(123)
+
+#train_index <- createDataPartition(y=iris$Species, p=0.7, list=FALSE)
+train_index <- createFolds(y = train_papers$included, k = 10, 
+                           list = TRUE, returnTrain = TRUE)
+
+pb <- txtProgressBar(1,length(train_index),style=3)
+
+for(j in seq_along(train_index)){
+  
+  ## Subset the data
+  training_set <- train_tb[-train_index[[j]], ]
+  testing_set <- train_tb[train_index[[j]], ]
+  
+  rf_cv <- randomForest(x = training_set %>% select(-label, -included),
+             y = training_set %>% pull(included) %>% as.factor(), 
+             ntree=1000, mtry = best_mtry)
+  
+  pred <- predict(rf_cv, type = "prob", newdata = testing_set)[,2]
+
+  obs <- testing_set %>% pull(included)
+  
+  thresh_seq <- seq(0.001, 1, by=0.001)
+  
+  metrics_matrix <- matrix(NA, nrow=length(thresh_seq), ncol= 4)
+  colnames(metrics_matrix) <- c("thresh","auc","recall","prec")
+    
+  for(i in seq_along(thresh_seq)){
+    
+    metrics_matrix[i,1] <- thresh_seq[i]
+    metrics_matrix[i,2] <- auroc(obs, as.integer(pred >= thresh_seq[i]))
+    metrics_matrix[i,3] <- Metrics::recall(obs, as.integer(pred >= thresh_seq[i]))
+    metrics_matrix[i,4] <- Metrics::precision(obs, as.integer(pred >= thresh_seq[i]))
+  }
+  
+  best_cutoff <- metrics_matrix %>% 
+    as.data.frame() %>% 
+    arrange(desc(auc)) %>% 
+    slice(1)
+  
+  if(j==1){
+    cv_df <- best_cutoff
+  }else{
+    cv_df <- rbind(cv_df, best_cutoff)
+  }
+  
+  setTxtProgressBar(pb, j)
+}
+
+knitr::kable(cv_df,digits = 3)
+
+knitr::kable(cv_df %>% summarise_all(.funs=list(avg=mean, std=sd)), digits = 3)
+
+
+```
+
+### Variable importance
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+#| fig-height: 12
+
+vimp <- importance(rf) %>% 
+  as.data.frame() %>% 
+  mutate(var_name = rownames(.)) %>% 
+  arrange(desc(MeanDecreaseGini))
+
+imp_vars <- vimp$var_name[1:50]
+
+varImpPlot(rf)
+```
+
+
+List of the top-50 features by decreasing order of Mean Decrease in Gini Index:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+knitr::kable(data.frame(vimp %>% slice(1:50) %>% 
+                          `rownames<-`(NULL)), digits = 2)
+
+```
+
+
+### Simplified model with best feature subset
+
+Re-train the model but now with the top-50 best set of features based on the importance rank:
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+## Selected best var set model
+rf1 <- randomForest(x = train_tb %>% select(all_of(imp_vars)),
+                   y = train_tb %>% pull(included) %>% as.factor(), 
+                   ntree=1000, mtry = best_mtry)
+
+print(rf1)
+
+plot(rf1)
+
+vimp <- importance(rf1) %>% 
+  as.data.frame() %>% 
+  mutate(var_name = rownames(.)) %>% 
+  arrange(desc(MeanDecreaseGini))
+
+#print(vimp)
+
+```
+
+
+## Full model
+
+### Optimize cut-off value
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+pred <- predict(rf, type = "prob")[,2]
+
+obs <- train_tb %>% pull(included)
+
+thresh_seq <- seq(0.001, 1, by=0.001)
+
+metrics_matrix <- matrix(NA, nrow=length(thresh_seq), ncol= 4)
+colnames(metrics_matrix) <- c("thresh","auc","recall","prec")
+  
+for(i in seq_along(thresh_seq)){
+  
+  metrics_matrix[i,1] <- thresh_seq[i]
+  metrics_matrix[i,2] <- auroc(obs, as.integer(pred >= thresh_seq[i]))
+  metrics_matrix[i,3] <- Metrics::recall(obs, as.integer(pred >= thresh_seq[i]))
+  metrics_matrix[i,4] <- Metrics::precision(obs, as.integer(pred >= thresh_seq[i]))
+}
+
+best_cutoff <- metrics_matrix %>% as.data.frame() %>% arrange(desc(auc)) %>% slice(1)
+
+knitr::kable(best_cutoff, digits = 3)
+
+```
+
+
+### Predict class labels for the entire dataset 
+
+Predict class labels using the full model and also the optimized cut-off
+
+```{r}
+#| error: false
+#| warning: false
+#| message: false
+#| echo: false
+
+
+pred_prob <- predict(rf, newdata = pred_tb %>% select(-label, -included), type="prob")[,2]
+
+pred_class <- as.integer(pred_prob >= best_cutoff$thresh[1])
+
+pclass_tb <- table(pred_class)
+
+
+cat("Predicted class percentages:\n\n")
+print(round( ((pclass_tb / sum(pclass_tb))*100), 1))
+
+```
